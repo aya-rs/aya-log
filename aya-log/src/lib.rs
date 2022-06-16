@@ -59,11 +59,17 @@
 //! [Log]: https://docs.rs/log/0.4.14/log/trait.Log.html
 //! [log]: https://docs.rs/log
 //!
-use std::{convert::TryInto, io, mem, ptr, str, sync::Arc};
+use std::{
+    convert::TryInto,
+    fmt::{LowerHex, UpperHex},
+    io, mem,
+    net::{Ipv4Addr, Ipv6Addr},
+    ptr, slice, str,
+    sync::Arc,
+};
 
-use aya_log_common::{ArgType, RecordField, LOG_BUF_CAPACITY, LOG_FIELDS};
+use aya_log_common::{ArgType, DisplayHint, RecordField, LOG_BUF_CAPACITY, LOG_FIELDS};
 use bytes::BytesMut;
-use dyn_fmt::AsStrFormatExt;
 use log::{error, Level, Log, Record};
 use thiserror::Error;
 
@@ -122,6 +128,60 @@ impl BpfLogger {
     }
 }
 
+pub trait Formatter<T> {
+    fn format(v: T) -> String;
+}
+
+pub struct DefaultFormatter;
+impl<T> Formatter<T> for DefaultFormatter
+where
+    T: ToString,
+{
+    fn format(v: T) -> String {
+        v.to_string()
+    }
+}
+
+pub struct LowerHexFormatter;
+impl<T> Formatter<T> for LowerHexFormatter
+where
+    T: LowerHex,
+{
+    fn format(v: T) -> String {
+        format!("{:x}", v)
+    }
+}
+
+pub struct UpperHexFormatter;
+impl<T> Formatter<T> for UpperHexFormatter
+where
+    T: UpperHex,
+{
+    fn format(v: T) -> String {
+        format!("{:X}", v)
+    }
+}
+
+pub struct Ipv4Formatter;
+impl<T> Formatter<T> for Ipv4Formatter
+where
+    Ipv4Addr: From<T>,
+{
+    fn format(v: T) -> String {
+        Ipv4Addr::from(v).to_string()
+    }
+}
+
+pub struct Ipv6Formatter;
+impl<T> Formatter<T> for Ipv6Formatter
+where
+    Ipv6Addr: From<T>,
+{
+    fn format(v: T) -> String {
+        Ipv6Addr::from(v).to_string()
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct DefaultLogger;
 
@@ -157,8 +217,7 @@ fn log_buf(mut buf: &[u8], logger: &dyn Log) -> Result<(), ()> {
     let mut module = None;
     let mut file = None;
     let mut line = None;
-    let mut log = None;
-    let mut num_args = None;
+    let mut num_args = 1;
 
     for _ in 0..LOG_FIELDS {
         let (attr, rest) = unsafe { TagLenValue::<'_, RecordField>::try_read(buf)? };
@@ -168,7 +227,7 @@ fn log_buf(mut buf: &[u8], logger: &dyn Log) -> Result<(), ()> {
                 target = Some(std::str::from_utf8(attr.value).map_err(|_| ())?);
             }
             RecordField::Level => {
-                level = unsafe { ptr::read_unaligned(attr.value.as_ptr() as *const _) }
+                level = unsafe { ptr::read_unaligned(attr.value.as_ptr() as *const _) };
             }
             RecordField::Module => {
                 module = Some(std::str::from_utf8(attr.value).map_err(|_| ())?);
@@ -180,109 +239,281 @@ fn log_buf(mut buf: &[u8], logger: &dyn Log) -> Result<(), ()> {
                 line = Some(u32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?));
             }
             RecordField::NumArgs => {
-                num_args = Some(usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?));
-            }
-            RecordField::Log => {
-                log = Some(std::str::from_utf8(attr.value).map_err(|_| ())?);
+                num_args = usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
             }
         }
 
         buf = rest;
     }
 
-    let log_msg = log.ok_or(())?;
-    let full_log_msg = match num_args {
-        Some(n) => {
-            let mut args: Vec<String> = Vec::new();
-            for _ in 0..n {
-                let (attr, rest) = unsafe { TagLenValue::<'_, ArgType>::try_read(buf)? };
+    let mut args: Vec<String> = Vec::new();
+    for _ in 0..num_args {
+        let (attr, rest) = unsafe { TagLenValue::<'_, ArgType>::try_read(buf)? };
 
-                match attr.tag {
-                    ArgType::I8 => {
-                        args.push(
-                            i8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
+        let arg = match attr.tag {
+            ArgType::I8 => {
+                let value = i8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format i8 as IPv4");
+                        return Err(());
                     }
-                    ArgType::I16 => {
-                        args.push(
-                            i16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format i8 as IPv6");
+                        return Err(());
                     }
-                    ArgType::I32 => {
-                        args.push(
-                            i32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::I64 => {
-                        args.push(
-                            i64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::I128 => {
-                        args.push(
-                            i128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Isize => {
-                        args.push(
-                            isize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
-                                .to_string(),
-                        );
-                    }
-                    ArgType::U8 => {
-                        args.push(
-                            u8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U16 => {
-                        args.push(
-                            u16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U32 => {
-                        args.push(
-                            u32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U64 => {
-                        args.push(
-                            u64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U128 => {
-                        args.push(
-                            u128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Usize => {
-                        args.push(
-                            usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
-                                .to_string(),
-                        );
-                    }
-                    ArgType::F32 => {
-                        args.push(
-                            f32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::F64 => {
-                        args.push(
-                            f64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Str => match str::from_utf8(attr.value) {
-                        Ok(v) => args.push(v.to_string()),
-                        Err(e) => error!("received invalid utf8 string: {}", e),
-                    },
                 }
-
-                buf = rest;
             }
+            ArgType::I16 => {
+                let value = i16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format i16 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format i16 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::I32 => {
+                let value = i32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format i32 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format i32 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::I64 => {
+                let value = i64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format i64 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format i64 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::Isize => {
+                let value = isize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format isize as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format isize as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::U8 => {
+                let value = u8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format u8 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format u8 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::U16 => {
+                let value = u16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format u16 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format u16 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::U32 => {
+                let value = u32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => Ipv4Formatter::format(value),
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format u32 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::U64 => {
+                let value = u64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format u64 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format u64 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::Usize => {
+                let value = usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => LowerHexFormatter::format(value),
+                    DisplayHint::UpperHex => UpperHexFormatter::format(value),
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format usize as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format usize as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::F32 => {
+                let value = f32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => {
+                        error!("Cannot format f32 as LowerHex");
+                        return Err(());
+                    }
+                    DisplayHint::UpperHex => {
+                        error!("Cannot format f32 as UpperHex");
+                        return Err(());
+                    }
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format f32 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format f32 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::F64 => {
+                let value = f64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                match attr.hint {
+                    DisplayHint::Default => DefaultFormatter::format(value),
+                    DisplayHint::LowerHex => {
+                        error!("Cannot format f64 as LowerHex");
+                        return Err(());
+                    }
+                    DisplayHint::UpperHex => {
+                        error!("Cannot format f64 as UpperHex");
+                        return Err(());
+                    }
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format f64 as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => {
+                        error!("Cannot format f64 as IPv6");
+                        return Err(());
+                    }
+                }
+            }
+            ArgType::ArrU8Len16 => {
+                let value: [u8; 16] = attr.value.try_into().map_err(|_| ())?;
+                match attr.hint {
+                    DisplayHint::Default => {
+                        error!("Cannot format [u8; 16] with the default formatter");
+                        return Err(());
+                    }
+                    DisplayHint::LowerHex => {
+                        error!("Cannot format [u8; 16] as LowerHex");
+                        return Err(());
+                    }
+                    DisplayHint::UpperHex => {
+                        error!("Cannot format [u8; 16] as UpperHex");
+                        return Err(());
+                    }
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format [u8; 16] as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => Ipv6Formatter::format(value),
+                }
+            }
+            ArgType::ArrU16Len8 => {
+                let len = attr.value.len();
+                let ptr = attr.value.as_ptr().cast::<u16>();
+                let slice = unsafe { slice::from_raw_parts(ptr, len) };
+                let mut value: [u16; 8] = Default::default();
+                value.copy_from_slice(slice);
+                match attr.hint {
+                    DisplayHint::Default => {
+                        error!("Cannot format [u16; 8] with the default formatter");
+                        return Err(());
+                    }
+                    DisplayHint::LowerHex => {
+                        error!("Cannot format [u16; 8] as LowerHex");
+                        return Err(());
+                    }
+                    DisplayHint::UpperHex => {
+                        error!("Cannot format [u16; 8] as UpperHex");
+                        return Err(());
+                    }
+                    DisplayHint::IPv4 => {
+                        error!("Cannot format [u16; 8] as IPv4");
+                        return Err(());
+                    }
+                    DisplayHint::IPv6 => Ipv6Formatter::format(value),
+                }
+            }
+            ArgType::Str => match str::from_utf8(attr.value) {
+                Ok(v) => v.to_string(),
+                Err(e) => {
+                    error!("received invalid utf8 string: {}", e);
+                    return Err(());
+                }
+            },
+        };
+        args.push(arg);
 
-            log_msg.format(&args)
-        }
-        None => log_msg.to_string(),
-    };
+        buf = rest;
+    }
+
+    let full_log_msg = args.join("");
 
     logger.log(
         &Record::builder()
@@ -300,17 +531,22 @@ fn log_buf(mut buf: &[u8], logger: &dyn Log) -> Result<(), ()> {
 
 struct TagLenValue<'a, T: Pod> {
     tag: T,
+    hint: DisplayHint,
     value: &'a [u8],
 }
 
 impl<'a, T: Pod> TagLenValue<'a, T> {
     unsafe fn try_read(mut buf: &'a [u8]) -> Result<(TagLenValue<'a, T>, &'a [u8]), ()> {
-        if buf.len() < mem::size_of::<T>() + mem::size_of::<usize>() {
+        if buf.len() < mem::size_of::<T>() + mem::size_of::<DisplayHint>() + mem::size_of::<usize>()
+        {
             return Err(());
         }
 
         let tag = ptr::read_unaligned(buf.as_ptr() as *const T);
         buf = &buf[mem::size_of::<T>()..];
+
+        let hint = ptr::read_unaligned(buf.as_ptr() as *const DisplayHint);
+        buf = &buf[mem::size_of::<DisplayHint>()..];
 
         let len = usize::from_ne_bytes(buf[..mem::size_of::<usize>()].try_into().unwrap());
         buf = &buf[mem::size_of::<usize>()..];
@@ -322,6 +558,7 @@ impl<'a, T: Pod> TagLenValue<'a, T> {
         Ok((
             TagLenValue {
                 tag,
+                hint,
                 value: &buf[..len],
             },
             &buf[len..],
@@ -332,31 +569,17 @@ impl<'a, T: Pod> TagLenValue<'a, T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use aya_log_common::{write_record_header, write_record_message, WriteToBuf};
+    use aya_log_test_macros::log;
     use log::logger;
     use testing_logger;
-
-    fn new_log(msg: &str, args: usize) -> Result<(usize, Vec<u8>), ()> {
-        let mut buf = vec![0; 8192];
-        let mut len = write_record_header(
-            &mut buf,
-            "test",
-            aya_log_common::Level::Info,
-            "test",
-            "test.rs",
-            123,
-            args,
-        )?;
-        len += write_record_message(&mut buf[len..], msg)?;
-        Ok((len, buf))
-    }
 
     #[test]
     fn test_str() {
         testing_logger::setup();
-        let (_, input) = new_log("test", 0).unwrap();
+        let mut buf = vec![0; 8192];
+        log!(buf, "test");
         let logger = logger();
-        let _ = log_buf(&input, logger);
+        let _ = log_buf(&buf, logger);
         testing_logger::validate(|captured_logs| {
             assert_eq!(captured_logs.len(), 1);
             assert_eq!(captured_logs[0].body, "test");
@@ -367,14 +590,28 @@ mod test {
     #[test]
     fn test_str_with_args() {
         testing_logger::setup();
-        let (len, mut input) = new_log("hello {}", 1).unwrap();
-        let name = "test";
-        (*name).write(&mut input[len..]).unwrap();
+        let mut buf = vec![0; 8192];
+        log!(buf, "hello {}", "test");
         let logger = logger();
-        let _ = log_buf(&input, logger);
+        let _ = log_buf(&buf, logger);
         testing_logger::validate(|captured_logs| {
             assert_eq!(captured_logs.len(), 1);
             assert_eq!(captured_logs[0].body, "hello test");
+            assert_eq!(captured_logs[0].level, Level::Info);
+        });
+    }
+
+    #[test]
+    fn test_str_with_hints() {
+        testing_logger::setup();
+        let mut buf = vec![0; 8192];
+        let ip: u32 = 1480603102;
+        log!(buf, "hello {:ipv4}", ip);
+        let logger = logger();
+        let _ = log_buf(&buf, logger);
+        testing_logger::validate(|captured_logs| {
+            assert_eq!(captured_logs.len(), 1);
+            assert_eq!(captured_logs[0].body, "hello 88.64.53.222");
             assert_eq!(captured_logs[0].level, Level::Info);
         });
     }

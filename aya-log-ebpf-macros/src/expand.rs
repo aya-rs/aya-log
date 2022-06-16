@@ -1,10 +1,16 @@
+use std::borrow::Cow;
+
 use proc_macro2::TokenStream;
 use quote::quote;
 use syn::{
     parse::{Parse, ParseStream},
+    parse_str,
     punctuated::Punctuated,
     Error, Expr, LitStr, Result, Token,
 };
+
+use aya_log_common::DisplayHint;
+use aya_log_parser::{parse, Fragment};
 
 pub(crate) struct LogArgs {
     pub(crate) ctx: Expr,
@@ -66,6 +72,20 @@ impl Parse for LogArgs {
     }
 }
 
+fn string_to_expr(s: Cow<str>) -> Result<Expr> {
+    parse_str(&format!("\"{}\"", s))
+}
+
+fn hint_to_expr(hint: DisplayHint) -> Result<Expr> {
+    match hint {
+        DisplayHint::Default => parse_str("::aya_log_ebpf::macro_support::DisplayHint::Default"),
+        DisplayHint::LowerHex => parse_str("::aya_log_ebpf::macro_support::DisplayHint::LowerHex"),
+        DisplayHint::UpperHex => parse_str("::aya_log_ebpf::macro_support::DisplayHint::UpperHex"),
+        DisplayHint::IPv4 => parse_str("::aya_log_ebpf::macro_support::DisplayHint::IPv4"),
+        DisplayHint::IPv6 => parse_str("::aya_log_ebpf::macro_support::DisplayHint::IPv6"),
+    }
+}
+
 pub(crate) fn log(args: LogArgs, level: Option<TokenStream>) -> Result<TokenStream> {
     let ctx = args.ctx;
     let target = match args.target {
@@ -83,48 +103,34 @@ pub(crate) fn log(args: LogArgs, level: Option<TokenStream>) -> Result<TokenStre
         ));
     };
     let format_string = args.format_string;
+    let format_string_val = format_string.value();
+    let fragments = parse(&format_string_val)
+        .map_err(|_| Error::new(format_string.span(), "could not parse the format string"))?;
 
-    let (num_args, write_args) = match args.formatting_args {
-        Some(formatting_args) => {
-            let formatting_exprs = formatting_args.iter();
-            let num_args = formatting_exprs.len();
-
-            let write_args = quote! {{
-                use ::aya_log_ebpf::WriteToBuf;
-                Ok::<_, ()>(record_len) #( .and_then(|record_len| {
-                    if record_len >= buf.buf.len() {
-                        return Err(());
-                    }
-                    { #formatting_exprs }.write(&mut buf.buf[record_len..]).map(|len| record_len + len)
-                }) )*
-            }};
-
-            (num_args, write_args)
-        }
-        None => (0, quote! {}),
-    };
-
-    // The way of writing to the perf buffer is different depending on whether
-    // we have variadic arguments or not.
-    let write_to_perf_buffer = if num_args > 0 {
-        // Writing with variadic arguments.
-        quote! {
-            if let Ok(record_len) = #write_args {
-                unsafe { ::aya_log_ebpf::AYA_LOGS.output(
-                    #ctx,
-                    &buf.buf[..record_len], 0
-                )}
+    let mut values = Vec::new();
+    let mut hints = Vec::new();
+    let mut arg_i = 0;
+    for fragment in fragments {
+        match fragment {
+            Fragment::Literal(s) => {
+                values.push(string_to_expr(s)?);
+                hints.push(hint_to_expr(DisplayHint::Default)?);
+            }
+            Fragment::Parameter(p) => {
+                let arg = match args.formatting_args {
+                    Some(ref args) => args[arg_i].clone(),
+                    None => return Err(Error::new(format_string.span(), "no arguments provided")),
+                };
+                values.push(arg);
+                hints.push(hint_to_expr(p.hint)?);
+                arg_i += 1;
             }
         }
-    } else {
-        // Writing with no variadic arguments.
-        quote! {
-            unsafe { ::aya_log_ebpf::AYA_LOGS.output(
-                #ctx,
-                &buf.buf[..record_len], 0
-            )}
-        }
-    };
+    }
+    let num_args = values.len();
+
+    let values_iter = values.iter();
+    let hints_iter = hints.iter();
 
     Ok(quote! {
         {
@@ -139,13 +145,21 @@ pub(crate) fn log(args: LogArgs, level: Option<TokenStream>) -> Result<TokenStre
                     line!(),
                     #num_args,
                 ) {
-                    if let Ok(message_len) = ::aya_log_ebpf::write_record_message(
-                        &mut buf.buf[header_len..],
-                        #format_string,
-                    ) {
-                        let record_len = header_len + message_len;
+                    let record_len = header_len;
 
-                        #write_to_perf_buffer
+                    if let Ok(record_len) = {
+                        use ::aya_log_ebpf::WriteToBuf;
+                        Ok::<_, ()>(record_len) #( .and_then(|record_len| {
+                            if record_len >= buf.buf.len() {
+                                return Err(());
+                            }
+                            { #values_iter }.write(&mut buf.buf[record_len..], #hints_iter).map(|len| record_len + len)
+                        }) )*
+                    } {
+                        unsafe { ::aya_log_ebpf::AYA_LOGS.output(
+                            #ctx,
+                            &buf.buf[..record_len], 0
+                        )}
                     }
                 }
             }

@@ -13,7 +13,8 @@ edition = "2018"
 [dependencies]
 aya = { version = "0.11.0", features=["async_tokio"] }
 aya-log-common = { version = "0.1.11-dev.0", path = "../aya-log-common", features=["userspace"] }
-dyn-fmt = "0.3.0"
+aya-log-parser = { version = "0.1.11-dev.0", path = "../aya-log-parser" }
+aya-log-test-macros = { version = "0.1.11-dev.0", path = "../aya-log-test-macros" }
 thiserror = "1"
 log = "0.4"
 bytes = "1.1"

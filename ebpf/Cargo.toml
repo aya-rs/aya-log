@@ -1,5 +1,5 @@
 [workspace]
-members = ["aya-log-ebpf", "aya-log-ebpf-macros", "example"]
+members = ["aya-log-ebpf", "example"]
 
 
 [profile.dev]

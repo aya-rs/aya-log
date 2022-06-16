@@ -13,6 +13,12 @@ pub fn example(ctx: TracePointContext) -> u32 {
     trace!(&ctx, "this is a trace message 🔍");
     let pid = ctx.pid();
     info!(&ctx, "a message with args PID: {}", pid);
+    let ip = 1575522155u32;
+    info!(&ctx, "IP address (as int): {}", ip);
+    info!(&ctx, "IP address (human readable): {:ipv4}", ip);
+    info!(&ctx, "number (base 10): {}", 42);
+    info!(&ctx, "number (hex): {:x}", 42);
+    info!(&ctx, "number (upper hex): {:X}", 42);
     0
 }
 

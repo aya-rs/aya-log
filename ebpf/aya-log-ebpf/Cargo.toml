@@ -6,7 +6,7 @@ edition = "2018"
 [dependencies]
 aya-bpf = { git = "https://github.com/aya-rs/aya", branch = "main" }
 aya-log-common = { path = "../../aya-log-common" }
-aya-log-ebpf-macros = { path = "../aya-log-ebpf-macros" }
+aya-log-ebpf-macros = { path = "../../aya-log-ebpf-macros" }
 
 [lib]
 path = "src/lib.rs"
