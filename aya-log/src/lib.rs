@@ -59,11 +59,10 @@
 //! [Log]: https://docs.rs/log/0.4.14/log/trait.Log.html
 //! [log]: https://docs.rs/log
 //!
-use std::{convert::TryInto, io, mem, ptr, str, sync::Arc};
+use std::{borrow::Cow, convert::TryInto, io, mem, net::Ipv4Addr, ptr, str, sync::Arc};
 
 use aya_log_common::{ArgType, RecordField, LOG_BUF_CAPACITY, LOG_FIELDS};
 use bytes::BytesMut;
-use dyn_fmt::AsStrFormatExt;
 use log::{error, Level, Log, Record};
 use thiserror::Error;
 
@@ -139,6 +138,150 @@ impl Log for DefaultLogger {
     }
 }
 
+/// All display hints
+#[derive(Clone, Debug, PartialEq)]
+pub enum DisplayHint {
+    /// `:ipv4`, `:IPv4`
+    IPv4,
+}
+
+/// A parsed formatting parameter (contents of `{` `}` block).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Parameter {
+    /// The display hint, e.g. ':ipv4', ':IPv4'.
+    pub hint: Option<DisplayHint>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Fragment<'a> {
+    /// A literal string (eg. `"literal "` in `"literal {}"`).
+    Literal(Cow<'a, str>),
+
+    /// A format parameter.
+    Parameter(Parameter),
+}
+
+fn push_literal<'a>(
+    frag: &mut Vec<Fragment<'a>>,
+    unescaped_literal: &'a str,
+) -> Result<(), Cow<'static, str>> {
+    // Replace `{{` with `{` and `}}` with `}`. Single braces are errors.
+
+    // Scan for single braces first. The rest is trivial.
+    let mut last_open = false;
+    let mut last_close = false;
+    for c in unescaped_literal.chars() {
+        match c {
+            '{' => last_open = !last_open,
+            '}' => last_close = !last_close,
+            _ => {
+                if last_open {
+                    return Err("unmatched `{` in format string".into());
+                }
+                if last_close {
+                    return Err("unmatched `}` in format string".into());
+                }
+            }
+        }
+    }
+
+    // Handle trailing unescaped `{` or `}`.
+    if last_open {
+        return Err("unmatched `{` in format string".into());
+    }
+    if last_close {
+        return Err("unmatched `}` in format string".into());
+    }
+
+    // FIXME: This always allocates a `String`, so the `Cow` is useless.
+    let literal = unescaped_literal.replace("{{", "{").replace("}}", "}");
+    frag.push(Fragment::Literal(literal.into()));
+    Ok(())
+}
+
+/// Parses the display hint (e.g. the `ipv4` in `{:ipv4}`).
+fn parse_display_hint(s: &str) -> Option<DisplayHint> {
+    Some(match s {
+        "ipv4" => DisplayHint::IPv4,
+        "IPv4" => DisplayHint::IPv4,
+        _ => return None,
+    })
+}
+
+/// Parse `Param` from `&str`
+///
+/// * example `input`: `:hint` (note: no curly braces)
+fn parse_param(mut input: &str) -> Result<Parameter, Cow<'static, str>> {
+    const HINT_PREFIX: &str = ":";
+
+    // Then, optional hint
+    let mut hint = None;
+
+    if input.starts_with(HINT_PREFIX) {
+        // skip the prefix
+        input = &input[HINT_PREFIX.len()..];
+        if input.is_empty() {
+            return Err("malformed format string (missing display hint after ':')".into());
+        }
+
+        hint = Some(match parse_display_hint(input) {
+            Some(a) => a,
+            None => return Err(format!("unknown display hint: {:?}", input).into()),
+        });
+    } else if !input.is_empty() {
+        return Err(format!("unexpected content {:?} in format string", input).into());
+    }
+
+    Ok(Parameter { hint })
+}
+
+pub fn parse<'a>(format_string: &'a str) -> Result<Vec<Fragment<'a>>, Cow<'static, str>> {
+    let mut fragments = Vec::new();
+
+    // Index after the `}` of the last format specifier.
+    let mut end_pos = 0;
+
+    let mut chars = format_string.char_indices();
+    while let Some((brace_pos, ch)) = chars.next() {
+        if ch != '{' {
+            // Part of a literal fragment.
+            continue;
+        }
+
+        // Peek at the next char.
+        if chars.as_str().starts_with('{') {
+            // Escaped `{{`, also part of a literal fragment.
+            chars.next(); // Move after both `{`s.
+            continue;
+        }
+
+        if brace_pos > end_pos {
+            // There's a literal fragment with at least 1 character before this parameter fragment.
+            let unescaped_literal = &format_string[end_pos..brace_pos];
+            push_literal(&mut fragments, unescaped_literal)?;
+        }
+
+        // Else, this is a format specifier. It ends at the next `}`.
+        let len = chars
+            .as_str()
+            .find('}')
+            .ok_or("missing `}` in format string")?;
+        end_pos = brace_pos + 1 + len + 1;
+
+        // Parse the contents inside the braces.
+        let param_str = &format_string[brace_pos + 1..][..len];
+        let param = parse_param(param_str)?;
+        fragments.push(Fragment::Parameter(param));
+    }
+
+    // Trailing literal.
+    if end_pos != format_string.len() {
+        push_literal(&mut fragments, &format_string[end_pos..])?;
+    }
+
+    Ok(fragments)
+}
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("error opening log event array")]
@@ -193,93 +336,129 @@ fn log_buf(mut buf: &[u8], logger: &dyn Log) -> Result<(), ()> {
     let log_msg = log.ok_or(())?;
     let full_log_msg = match num_args {
         Some(n) => {
-            let mut args: Vec<String> = Vec::new();
-            for _ in 0..n {
-                let (attr, rest) = unsafe { TagLenValue::<'_, ArgType>::try_read(buf)? };
+            let fragments = parse(log_msg).map_err(|_| ())?;
+            let mut msg = String::new();
+            let mut arg = 0;
 
-                match attr.tag {
-                    ArgType::I8 => {
-                        args.push(
-                            i8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
+            for fragment in fragments {
+                match fragment {
+                    Fragment::Literal(s) => msg.push_str(&s),
+                    Fragment::Parameter(p) => {
+                        let (attr, rest) = unsafe { TagLenValue::<'_, ArgType>::try_read(buf)? };
+
+                        match attr.tag {
+                            ArgType::I8 => {
+                                msg.push_str(
+                                    &i8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::I16 => {
+                                msg.push_str(
+                                    &i16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::I32 => {
+                                msg.push_str(
+                                    &i32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::I64 => {
+                                msg.push_str(
+                                    &i64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::I128 => {
+                                msg.push_str(
+                                    &i128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::Isize => {
+                                msg.push_str(
+                                    &isize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::U8 => {
+                                msg.push_str(
+                                    &u8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::U16 => {
+                                msg.push_str(
+                                    &u16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::U32 => {
+                                let val =
+                                    u32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?);
+                                match p.hint {
+                                    Some(DisplayHint::IPv4) => {
+                                        let ip = Ipv4Addr::from(val);
+                                        msg.push_str(&ip.to_string());
+                                    }
+                                    None => {
+                                        msg.push_str(&val.to_string());
+                                    }
+                                }
+                            }
+                            ArgType::U64 => {
+                                msg.push_str(
+                                    &u64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::U128 => {
+                                msg.push_str(
+                                    &u128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::Usize => {
+                                msg.push_str(
+                                    &usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::F32 => {
+                                msg.push_str(
+                                    &f32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::F64 => {
+                                msg.push_str(
+                                    &f64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
+                                        .to_string(),
+                                );
+                            }
+                            ArgType::Str => match str::from_utf8(attr.value) {
+                                Ok(v) => msg.push_str(&v.to_string()),
+                                Err(e) => error!("received invalid utf8 string: {}", e),
+                            },
+                        }
+
+                        buf = rest;
+                        arg += 1;
                     }
-                    ArgType::I16 => {
-                        args.push(
-                            i16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::I32 => {
-                        args.push(
-                            i32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::I64 => {
-                        args.push(
-                            i64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::I128 => {
-                        args.push(
-                            i128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Isize => {
-                        args.push(
-                            isize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
-                                .to_string(),
-                        );
-                    }
-                    ArgType::U8 => {
-                        args.push(
-                            u8::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U16 => {
-                        args.push(
-                            u16::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U32 => {
-                        args.push(
-                            u32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U64 => {
-                        args.push(
-                            u64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::U128 => {
-                        args.push(
-                            u128::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Usize => {
-                        args.push(
-                            usize::from_ne_bytes(attr.value.try_into().map_err(|_| ())?)
-                                .to_string(),
-                        );
-                    }
-                    ArgType::F32 => {
-                        args.push(
-                            f32::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::F64 => {
-                        args.push(
-                            f64::from_ne_bytes(attr.value.try_into().map_err(|_| ())?).to_string(),
-                        );
-                    }
-                    ArgType::Str => match str::from_utf8(attr.value) {
-                        Ok(v) => args.push(v.to_string()),
-                        Err(e) => error!("received invalid utf8 string: {}", e),
-                    },
                 }
-
-                buf = rest;
             }
 
-            log_msg.format(&args)
+            if arg != n {
+                error!(
+                    "received invalid number of arguments: expected {}, got {}",
+                    n, arg
+                );
+                return Err(());
+            }
+
+            msg
         }
         None => log_msg.to_string(),
     };
@@ -336,6 +515,30 @@ mod test {
     use log::logger;
     use testing_logger;
 
+    #[test]
+    fn test_parse() {
+        assert_eq!(
+            parse("foo {} bar"),
+            Ok(vec![
+                Fragment::Literal("foo ".into()),
+                Fragment::Parameter(Parameter {
+                    hint: None
+                }),
+                Fragment::Literal(" bar".into())
+            ])
+        );
+        assert_eq!(
+            parse("foo {:ipv4} bar"),
+            Ok(vec![
+                Fragment::Literal("foo ".into()),
+                Fragment::Parameter(Parameter {
+                    hint: Some(DisplayHint::IPv4)
+                }),
+                Fragment::Literal(" bar".into())
+            ])
+        )
+    }
+
     fn new_log(msg: &str, args: usize) -> Result<(usize, Vec<u8>), ()> {
         let mut buf = vec![0; 8192];
         let mut len = write_record_header(
@@ -375,6 +578,21 @@ mod test {
         testing_logger::validate(|captured_logs| {
             assert_eq!(captured_logs.len(), 1);
             assert_eq!(captured_logs[0].body, "hello test");
+            assert_eq!(captured_logs[0].level, Level::Info);
+        });
+    }
+
+    #[test]
+    fn test_str_with_hints() {
+        testing_logger::setup();
+        let (len, mut input) = new_log("hello {:ipv4}", 1).unwrap();
+        let ip: u32 = 1480603102;
+        ip.write(&mut input[len..]).unwrap();
+        let logger = logger();
+        let _ = log_buf(&input, logger);
+        testing_logger::validate(|captured_logs| {
+            assert_eq!(captured_logs.len(), 1);
+            assert_eq!(captured_logs[0].body, "hello 88.64.53.222");
             assert_eq!(captured_logs[0].level, Level::Info);
         });
     }
