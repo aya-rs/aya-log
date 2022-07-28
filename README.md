@@ -1,3 +1,5 @@
+**This repo has been moved. It is now located at https://github.com/aya-rs/aya**
+
 # aya-log - a logging library for eBPF programs
 
 ## Overview
